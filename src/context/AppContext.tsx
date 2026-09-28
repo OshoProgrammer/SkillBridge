@@ -27,6 +27,7 @@ import {
   sendGmailOtp,
   verifyGmailOtp,
   loginOfficer,
+  setAuthToken,
 } from '../services/api';
 
 export type NetworkStatus = 'ONLINE' | 'OFFLINE' | 'SYNCING' | 'SYNCED';
@@ -85,7 +86,7 @@ interface AppContextType {
     role?: RoleType,
     password?: string,
     skipMfa?: boolean
-  ) => { success: boolean; requiresMfa?: boolean; error?: string; requiresRegistration?: boolean };
+  ) => Promise<{ success: boolean; requiresMfa?: boolean; error?: string; requiresRegistration?: boolean }>;
   verifyMfa: (code: string) => boolean;
   cancelMfa: () => void;
   mfaPendingUser: User | null;
@@ -111,7 +112,6 @@ interface AppContextType {
     error?: string;
     accountExists?: boolean;
     deliveredToMailbox?: boolean;
-    sandboxOtp?: string;
     smtpConfigured?: boolean;
   }>;
   confirmGmailOtp: (
@@ -295,7 +295,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [sessionSecurity, setSessionSecurity] = useState<SessionSecurity>({
     encrypted: true,
     protocol: 'TLS 1.3 • AES-256-GCM (GovNet Apex)',
-    token: 'GOVNET-SEC-SESSION-7f3b891a2c',
+    token: '',
     expiresAt: new Date(Date.now() + 8 * 3600 * 1000).toISOString(),
     clearanceLevel: 'LEVEL 3 — SECRET / RESTRICTED',
     verifiedGovNetId: 'SDGD-CADRE-101',
@@ -446,8 +446,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     loadData();
   }, []);
 
-  const finalizeUserLogin = (user: User, role?: RoleType) => {
-    const newToken = `GOVNET-SEC-${Math.random().toString(36).substring(2, 9).toUpperCase()}-${Date.now()}`;
+  const finalizeUserLogin = (user: User, token: string, expiresAt: string, role?: RoleType) => {
     setCurrentUser(user);
     setActiveRole(role || user.role);
     setIsAuthenticated(true);
@@ -455,8 +454,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setSessionSecurity({
       encrypted: true,
       protocol: 'TLS 1.3 • AES-256-GCM (GovNet Apex)',
-      token: newToken,
-      expiresAt: new Date(Date.now() + 8 * 3600 * 1000).toISOString(),
+      token,
+      expiresAt,
       clearanceLevel: user.securityClearance || 'LEVEL 3 — SECRET / RESTRICTED',
       verifiedGovNetId: user.civilServiceId || user.employeeId || 'SDGD-CADRE-101',
       isMfaVerified: true,
@@ -470,7 +469,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       actorRole: user.role,
       action: 'SECURITY_AUTH_MFA_SUCCESS',
       entityType: 'competency',
-      details: `Officer ${user.name} (${user.civilServiceId || user.email}) authenticated via Multi-Factor Auth (Session: ${newToken.slice(0, 16)}...).`,
+      details: `Officer ${user.name} (${user.civilServiceId || user.email}) authenticated via server-issued session.`,
       organizationId: organization?.id || 'org-state-gov',
     };
     setAuditLogs((prev) => [secLog, ...prev]);
@@ -483,6 +482,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const logout = () => {
+    setAuthToken(null);
     setIsAuthenticated(false);
     setMfaPendingUser(null);
     setIsSessionLocked(false);
@@ -494,15 +494,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const switchUser = (userId: string) => {
-    const found = users.find((u) => u.id === userId);
-    if (found) {
-      finalizeUserLogin(found, found.role);
-      addToast({
-        type: 'info',
-        title: 'Officer Switched',
-        message: `Viewing as ${found.name} (${found.designation})`,
-      });
-    }
+    addToast({
+      type: 'warning',
+      title: 'Authentication Required',
+      message: 'Please sign in with that officer’s credentials to change accounts.',
+    });
   };
 
   const switchRole = (role: RoleType) => {
@@ -559,12 +555,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     );
   };
 
-  const loginWithCredentials = (
+  const loginWithCredentials = async (
     identifier: string,
     role?: RoleType,
     password?: string,
     skipMfa?: boolean
-  ): { success: boolean; requiresMfa?: boolean; error?: string; requiresRegistration?: boolean } => {
+  ): Promise<{ success: boolean; requiresMfa?: boolean; error?: string; requiresRegistration?: boolean }> => {
     if (isRateLimited) {
       return {
         success: false,
@@ -572,58 +568,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       };
     }
 
-    const found = findUserByIdentifier(identifier);
-    if (!found) {
-      addToast({
-        type: 'error',
-        title: 'Account Not Found',
-        message: 'Only registered personnel can sign in. If you do not have an account, please create one first.',
-      });
-      return {
-        success: false,
-        error: 'Account not found. Only registered personnel can sign in. If you do not have an account, please create one first.',
-        requiresRegistration: true,
-      };
-    }
-
-    // If password is provided, validate against authorized passwords
-    if (password !== undefined) {
-      const validPasswords = ['demo1234', 'Officer#2026', 'State#2026', 'Admin#2026', 'Gov#2026', 'Password#123'];
-      const isPasswordValid = validPasswords.includes(password) || password.length >= 6;
-      if (!isPasswordValid) {
-        const nextFailed = failedLoginAttempts + 1;
-        setFailedLoginAttempts(nextFailed);
-        if (nextFailed >= 4) {
-          setIsRateLimited(true);
-          setRateLimitCountdown(45);
-          addToast({
-            type: 'error',
-            title: 'Security Alert: Gateway Locked',
-            message: 'Suspicious authentication activity detected. Gateway locked for 45s.',
-          });
-          return {
-            success: false,
-            error: 'Security Lockout: 4 consecutive failed attempts. Gateway locked for 45s.',
-          };
-        }
-        addToast({
-          type: 'warning',
-          title: 'Authentication Rejected',
-          message: `Invalid security passkey. ${4 - nextFailed} attempts remaining before security lockout.`,
-        });
-        return {
-          success: false,
-          error: `Invalid passkey. ${4 - nextFailed} attempts remaining before lockdown.`,
-        };
+    try {
+      const response = await loginOfficer({ identifier, password, role });
+      if (!response.success || !response.user || !response.token || !response.expiresAt) {
+        return { success: false, error: response.error || 'Authentication failed.', requiresRegistration: response.requiresRegistration };
       }
+      setAuthToken(response.token);
+      setFailedLoginAttempts(0);
+      finalizeUserLogin(response.user, response.token, response.expiresAt, response.user.role);
+      return { success: true, requiresMfa: false };
+    } catch {
+      return { success: false, error: 'Could not reach the authentication gateway.' };
     }
-
-    // Credentials valid, reset failed counter
-    setFailedLoginAttempts(0);
-    const targetUser = found;
-
-    finalizeUserLogin(targetUser, role || targetUser.role);
-    return { success: true, requiresMfa: false };
   };
 
   const requestGmailOtp = async (details: {
@@ -640,7 +596,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     error?: string;
     accountExists?: boolean;
     deliveredToMailbox?: boolean;
-    sandboxOtp?: string;
     smtpConfigured?: boolean;
   }> => {
     try {
@@ -648,16 +603,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.success) {
         addToast({
           type: res.deliveredToMailbox ? 'success' : 'info',
-          title: res.deliveredToMailbox ? 'Verification Email Dispatched' : 'Verification Code Generated',
-          message: res.deliveredToMailbox
-            ? `An email has been sent directly to ${details.email}. Check inbox & spam folder.`
-            : `Code generated for ${details.email}. See sandbox dispatch code below.`,
+          title: 'Verification Email Dispatched',
+          message: `An email has been sent directly to ${details.email}. Check inbox & spam folder.`,
         });
         return {
           success: true,
           message: res.message,
           deliveredToMailbox: res.deliveredToMailbox,
-          sandboxOtp: res.sandboxOtp,
           smtpConfigured: res.smtpConfigured,
         };
       } else {
@@ -689,7 +641,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (res.employee) {
           setEmployees((prev) => [res.employee, ...prev.filter((e) => e.id !== res.employee.id)]);
         }
-        finalizeUserLogin(res.user, res.user.role);
+        if (!res.token || !res.expiresAt) return { success: false, error: 'Authentication session was not created.' };
+        setAuthToken(res.token);
+        finalizeUserLogin(res.user, res.token, res.expiresAt, res.user.role);
         addToast({
           type: 'success',
           title: 'Gmail Verified & Account Created',
@@ -726,9 +680,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return false;
     }
 
-    finalizeUserLogin(mfaPendingUser, mfaPendingUser.role);
-    setMfaPendingUser(null);
-    return true;
+    addToast({ type: 'error', title: 'MFA Unavailable', message: 'Authenticator verification must be completed by the server.' });
+    return false;
   };
 
   const cancelMfa = () => {

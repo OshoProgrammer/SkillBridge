@@ -1,7 +1,8 @@
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import path from "path";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
+import { createHash, randomBytes, randomInt, scryptSync, timingSafeEqual } from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import {
@@ -146,19 +147,77 @@ function getGeminiClient(): GoogleGenAI | null {
 }
 
 interface PendingRegistration {
-  otp: string;
+  otpHash: string;
   email: string;
   name: string;
   role: RoleType;
   departmentId: string;
   designation: string;
   employeeCode: string;
-  password?: string;
+  passwordHash: string;
   expiresAt: number;
   attempts: number;
 }
 
 const pendingRegistrations = new Map<string, PendingRegistration>();
+// Tests may shorten time only under the dedicated test runtime; all normal and
+// production executions enforce the required ten-minute lifetime.
+const OTP_TTL_MS = process.env.NODE_ENV === "test" ? Number(process.env.OTP_TTL_MS || 10 * 60 * 1000) : 10 * 60 * 1000;
+const MAX_OTP_ATTEMPTS = 5;
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+interface AuthSession {
+  userId: string;
+  expiresAt: number;
+}
+
+const sessions = new Map<string, AuthSession>();
+const passwordHashes = new Map<string, string>();
+
+function hashOtp(otp: string) {
+  return createHash("sha256").update(otp).digest("hex");
+}
+
+function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
+}
+
+function verifyPassword(password: string, stored: string) {
+  const [salt, expected] = stored.split(":");
+  if (!salt || !expected) return false;
+  const actual = scryptSync(password, salt, 64).toString("hex");
+  return actual.length === expected.length && timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"));
+}
+
+function createSession(userId: string) {
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  sessions.set(token, { userId, expiresAt });
+  return { token, expiresAt };
+}
+
+function extractSession(req: Request) {
+  const authorization = req.get("authorization");
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : undefined;
+  if (!token) return null;
+  const session = sessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) sessions.delete(token);
+    return null;
+  }
+  return { token, session };
+}
+
+function requireAuthenticated(req: Request, res: Response, next: NextFunction) {
+  const session = extractSession(req);
+  if (!session) return res.status(401).json({ success: false, error: "Authentication is required." });
+  (req as Request & { authenticatedUserId?: string }).authenticatedUserId = session.session.userId;
+  next();
+}
+
+// Seeded demonstration accounts use a server-side password hash; plaintext is never stored.
+for (const user of db.users) passwordHashes.set(user.id, hashPassword("demo1234"));
 
 // Runtime SMTP configuration store (allows setting up live Gmail delivery)
 let runtimeSmtpConfig: {
@@ -200,15 +259,9 @@ function createMailTransporter() {
 
 async function sendOtpEmail(toEmail: string, otpCode: string, officerName: string) {
   const transporter = createMailTransporter();
-  console.log(`\n======================================================`);
-  console.log(`[GMAIL OTP DISPATCH SERVICE]`);
-  console.log(`To: ${toEmail} (${officerName})`);
-  console.log(`Generated 6-Digit OTP: [ ${otpCode} ]`);
-  console.log(`Timestamp: ${new Date().toISOString()}`);
-  console.log(`======================================================\n`);
 
   if (!transporter) {
-    console.log(`[GMAIL OTP SERVICE] No SMTP credentials configured. Returning OTP code to client sandbox.`);
+    console.warn("[OTP DELIVERY] SMTP is not configured; OTP was not issued.");
     return { sentViaSmtp: false, reason: "No SMTP credentials configured on server" };
   }
 
@@ -243,7 +296,7 @@ async function sendOtpEmail(toEmail: string, otpCode: string, officerName: strin
         </div>
       `,
     });
-    console.log(`[GMAIL OTP SERVICE] Email dispatched successfully to ${toEmail}. Message ID:`, info.messageId);
+    console.log(`[OTP DELIVERY] Verification email dispatched to ${toEmail}. Message ID: ${info.messageId}`);
     return { sentViaSmtp: true, messageId: info.messageId };
   } catch (err: any) {
     console.error(`[GMAIL OTP SERVICE] Error sending email via SMTP:`, err?.message || err);
@@ -285,7 +338,7 @@ async function startServer() {
   });
 
   // 2. Reset / Seed Demo State (for easy hero demo walkthrough)
-  app.post("/api/reset-state", (req: Request, res: Response) => {
+  app.post("/api/reset-state", requireAuthenticated, (req: Request, res: Response) => {
     db.organization = { ...INITIAL_ORGANIZATION };
     db.departments = [...INITIAL_DEPARTMENTS];
     db.competencies = [...INITIAL_COMPETENCIES];
@@ -347,16 +400,11 @@ async function startServer() {
       });
     }
 
-    // Password verification
-    if (password !== undefined) {
-      const validPasswords = ["demo1234", "Officer#2026", "State#2026", "Admin#2026", "Gov#2026", "Password#123"];
-      const isPasswordValid = validPasswords.includes(password) || password.length >= 6;
-      if (!isPasswordValid) {
-        return res.status(401).json({
-          success: false,
-          error: "Invalid security passkey. Please check your credentials.",
-        });
-      }
+    if (typeof password !== "string" || !verifyPassword(password, passwordHashes.get(user.id) || "")) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid security passkey. Please check your credentials.",
+      });
     }
 
     const employee = db.employees.find((e) => e.id === user.employeeId || e.email.toLowerCase() === user.email.toLowerCase());
@@ -372,10 +420,13 @@ async function startServer() {
       organizationId: db.organization.id,
     });
 
+    const session = createSession(user.id);
     res.json({
       success: true,
       user,
       employee,
+      token: session.token,
+      expiresAt: new Date(session.expiresAt).toISOString(),
       message: `Identity verified for ${user.name}.`,
     });
   });
@@ -388,9 +439,6 @@ async function startServer() {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const smtpConfig = resolveSmtpConfig();
-    const hasLiveSmtp = !!(smtpConfig.user && smtpConfig.pass);
-
     // Check if an account already exists for this email
     const existing = db.users.find((u) => u.email.toLowerCase() === cleanEmail);
     if (existing) {
@@ -401,44 +449,48 @@ async function startServer() {
       });
     }
 
-    // Generate random 6-digit cryptographic OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const passwordValue = typeof password === "string" && password.length >= 8 ? password : null;
+    if (!passwordValue) {
+      return res.status(400).json({ success: false, error: "Password must be at least 8 characters." });
+    }
+    // Complete password hashing before starting the OTP lifetime.
+    const passwordHash = hashPassword(passwordValue);
+    // `randomInt` is backed by Node's cryptographically secure RNG.
+    const otp = randomInt(0, 1_000_000).toString().padStart(6, "0");
 
-    pendingRegistrations.set(cleanEmail, {
-      otp,
+    const registration: PendingRegistration = {
+      otpHash: hashOtp(otp),
       email: cleanEmail,
       name: name?.trim() || cleanEmail.split("@")[0].replace(".", " "),
       role: role || "learner",
       departmentId: departmentId || db.departments[0]?.id || "dept-it-gov",
       designation: designation?.trim() || "Civil Service Officer",
       employeeCode: employeeCode?.trim() || `SDGD-CADRE-${Math.floor(1000 + Math.random() * 9000)}`,
-      password: password || "demo1234",
-      expiresAt,
+      passwordHash,
+      expiresAt: 0,
       attempts: 0,
-    });
+    };
 
-    // Send email via nodemailer / log to terminal
+    // Do not create a usable OTP until delivery succeeds. There is deliberately no
+    // response, log, or development fallback that exposes the code.
     const emailResult = await sendOtpEmail(cleanEmail, otp, name || "Officer");
-
-    if (!hasLiveSmtp && !emailResult.sentViaSmtp) {
-      console.warn("[SMTP CONFIG] No live Gmail SMTP credentials detected. Server is falling back to sandbox OTP output.");
+    if (!emailResult.sentViaSmtp) {
+      return res.status(503).json({
+        success: false,
+        error: "Verification email delivery is unavailable. Configure SMTP and try again.",
+      });
     }
-
-    const isSmtpLive = !!(runtimeSmtpConfig?.user || process.env.SMTP_USER || process.env.GMAIL_USER || process.env.EMAIL_USER || process.env.MAIL_USER);
+    // The recipient receives the full ten-minute window, independent of SMTP latency.
+    registration.expiresAt = Date.now() + OTP_TTL_MS;
+    // Replacing the map entry invalidates any earlier code for this address.
+    pendingRegistrations.set(cleanEmail, registration);
 
     res.json({
       success: true,
-      deliveredToMailbox: emailResult.sentViaSmtp,
-      smtpConfigured: isSmtpLive,
-      message: emailResult.sentViaSmtp
-        ? `A 6-digit verification code has been dispatched directly to your Gmail (${email}). Please check your inbox and spam folder.`
-        : hasLiveSmtp
-          ? `SMTP credentials are present but delivery failed. Check the Gmail App Password and allow less secure sign-in restrictions or recent Google security changes.`
-          : `Email delivery simulation: No live SMTP gateway is connected yet. Your official verification code is displayed below.`,
+      deliveredToMailbox: true,
+      message: `A 6-digit verification code has been dispatched directly to your Gmail (${email}). Please check your inbox and spam folder.`,
       email: cleanEmail,
       expiresInSeconds: 600,
-      sandboxOtp: emailResult.sentViaSmtp ? undefined : otp,
     });
   });
 
@@ -456,7 +508,7 @@ async function startServer() {
   });
 
   // E. Configure Live Gmail SMTP credentials at runtime
-  app.post("/api/auth/smtp-config", async (req: Request, res: Response) => {
+  app.post("/api/auth/smtp-config", requireAuthenticated, async (req: Request, res: Response) => {
     const { user, pass, host = "smtp.gmail.com", port = 587 } = req.body;
     if (!user || !pass) {
       return res.status(400).json({ success: false, error: "Gmail address and Google App Password are required." });
@@ -519,12 +571,15 @@ async function startServer() {
       });
     }
 
-    // Compare with the generated OTP (or standard dev fallback 123456 if local SMTP is offline)
-    const isMatch = cleanOtp === record.otp || cleanOtp === "123456";
+    if (!/^\d{6}$/.test(cleanOtp)) {
+      return res.status(400).json({ success: false, error: "Verification code must contain exactly 6 digits." });
+    }
+    const suppliedHash = hashOtp(cleanOtp);
+    const isMatch = timingSafeEqual(Buffer.from(suppliedHash, "hex"), Buffer.from(record.otpHash, "hex"));
 
     if (!isMatch) {
       record.attempts += 1;
-      if (record.attempts >= 5) {
+      if (record.attempts >= MAX_OTP_ATTEMPTS) {
         pendingRegistrations.delete(cleanEmail);
         return res.status(400).json({
           success: false,
@@ -533,7 +588,7 @@ async function startServer() {
       }
       return res.status(400).json({
         success: false,
-        error: `Invalid verification code. ${5 - record.attempts} attempts remaining. Please check your Gmail.`,
+        error: `Invalid verification code. ${MAX_OTP_ATTEMPTS - record.attempts} attempts remaining. Please check your Gmail.`,
       });
     }
 
@@ -589,6 +644,7 @@ async function startServer() {
 
     db.users.push(newUser);
     db.employees.push(newEmployee);
+    passwordHashes.set(newUser.id, record.passwordHash);
     pendingRegistrations.delete(cleanEmail);
 
     // Audit log
@@ -603,14 +659,21 @@ async function startServer() {
       organizationId: db.organization.id,
     });
 
+    const session = createSession(newUser.id);
     res.json({
       success: true,
       message: `Gmail authenticated successfully! Account created for ${newUser.name}.`,
       user: newUser,
       employee: newEmployee,
       users: db.users,
+      token: session.token,
+      expiresAt: new Date(session.expiresAt).toISOString(),
     });
   });
+
+  // All application mutations below this point require a server-issued session.
+  // The public state snapshot remains available only to bootstrap the existing login UI.
+  app.use("/api", requireAuthenticated);
 
   // 3. Update Role Required Competencies (Step 1 in Hero Flow)
   app.put("/api/roles/:roleId/competencies", (req: Request, res: Response) => {

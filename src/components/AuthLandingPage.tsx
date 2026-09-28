@@ -76,7 +76,6 @@ export const AuthLandingPage: React.FC = () => {
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
   const [otpResendCooldown, setOtpResendCooldown] = useState(0);
   const [deliveredToMailbox, setDeliveredToMailbox] = useState<boolean | null>(null);
-  const [sandboxOtp, setSandboxOtp] = useState<string | null>(null);
   const [showSmtpConfig, setShowSmtpConfig] = useState(false);
   const [smtpUser, setSmtpUser] = useState('');
   const [smtpPass, setSmtpPass] = useState('');
@@ -251,7 +250,7 @@ export const AuthLandingPage: React.FC = () => {
     switchUser(personaId);
   };
 
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError(null);
     if (!loginIdentifier.trim()) {
@@ -277,7 +276,7 @@ export const AuthLandingPage: React.FC = () => {
       return;
     }
 
-    const res = loginWithCredentials(loginIdentifier, loginRole, loginPassword, true);
+    const res = await loginWithCredentials(loginIdentifier, loginRole, loginPassword, true);
     if (!res.success && res.error) {
       setLoginError(res.error);
     }
@@ -320,7 +319,6 @@ export const AuthLandingPage: React.FC = () => {
         setRegStep('otp');
         setRegOtp('');
         setDeliveredToMailbox(!!res.deliveredToMailbox);
-        setSandboxOtp(res.sandboxOtp || null);
         setOtpResendCooldown(45);
       } else if (res.accountExists) {
         setActiveTab('login');
@@ -369,7 +367,6 @@ export const AuthLandingPage: React.FC = () => {
       });
       if (res.success) {
         setDeliveredToMailbox(!!res.deliveredToMailbox);
-        setSandboxOtp(res.sandboxOtp || null);
         setOtpResendCooldown(45);
       }
     } finally {
@@ -968,8 +965,7 @@ export const AuthLandingPage: React.FC = () => {
                   </div>
 
                   {/* Delivery Status / Gateway Notice */}
-                  {deliveredToMailbox ? (
-                    <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-start gap-2.5">
+                  <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-start gap-2.5">
                       <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                       <div>
                         <p className="font-semibold text-emerald-200">Email Dispatched Directly via SMTP</p>
@@ -978,39 +974,6 @@ export const AuthLandingPage: React.FC = () => {
                         </p>
                       </div>
                     </div>
-                  ) : (
-                    <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs">
-                      <div className="flex items-center justify-between mb-1.5">
-                        <span className="font-bold text-amber-400 flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
-                          <Shield className="w-3.5 h-3.5" /> GovNet Dispatch Gateway Notice
-                        </span>
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                          {liveSmtpUser ? 'Offline Simulation' : 'Sandbox Dispatch'}
-                        </span>
-                      </div>
-                      <p className="text-slate-300 text-[11px] leading-relaxed mb-2.5">
-                        Outbound SMTP is not connected on this server, so email was not routed to Gmail servers. Your verification code is:
-                      </p>
-                      {sandboxOtp && (
-                        <div className="flex items-center justify-between p-2 rounded-xl bg-black/60 border border-amber-500/40">
-                          <div className="flex items-center gap-2 pl-2">
-                            <span className="text-[10px] uppercase font-mono text-slate-400">Code:</span>
-                            <span className="font-mono text-xl font-black tracking-widest text-amber-400">{sandboxOtp}</span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setRegOtp(sandboxOtp);
-                              addToast({ type: 'info', title: 'Code Filled', message: 'Verification code inserted.' });
-                            }}
-                            className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs flex items-center gap-1 shadow transition-all active:scale-95"
-                          >
-                            <Check className="w-3.5 h-3.5" /> Auto-Fill Code
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
 
                   <form onSubmit={handleVerifyOtp} className="space-y-4">
                     <div>
